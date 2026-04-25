@@ -208,6 +208,3 @@ If you use splice-outlier in published work, please also cite FRASER2 which this
 
 > Scheller et al. (2023) Improved detection of aberrant splicing with FRASER 2.0 and the intron Jaccard index. *Am J Hum Genet* 110(12):2056–2067. https://doi.org/10.1016/j.ajhg.2023.10.014
 
-## License
-
-MIT
