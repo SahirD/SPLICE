@@ -4,7 +4,7 @@ All notable changes to this project will be documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
-## [0.2.0] — 2025
+## [0.2.0] — Apr 2026
 
 ### Added
 - `extract_sample_counts()` — BAM → per-sample parquet extraction (replaces STAR SJ.out.tab input).
@@ -31,7 +31,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Removed
 - Direct STAR SJ.out.tab reading (superseded by BAM extraction).
 
-## [0.1.0] — 2025
+## [0.1.0]
 
 ### Added
 - Initial release.
