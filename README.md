@@ -1,3 +1,5 @@
+# NOTE: NOT ready for use
+
 # splice-outlier
 
 Fast, scalable detection of aberrant splicing events in RNA-seq cohorts.
