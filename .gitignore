@@ -1,0 +1,55 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+.installed.cfg
+
+# Virtual environments
+.venv/
+venv/
+env/
+.env
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# Type checking
+.mypy_cache/
+.pytype/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+
+# Data / large files (never commit BAMs or parquets)
+*.bam
+*.bai
+*.cram
+*.crai
+*.parquet
+*.h5ad
+*.hdf5
+*.h5
+
+# Logs
+*.log
