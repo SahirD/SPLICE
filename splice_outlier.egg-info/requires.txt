@@ -1,0 +1,16 @@
+numpy
+pandas
+scipy
+tqdm
+statsmodels
+joblib
+pyarrow
+anndata
+scikit-learn
+
+[bam]
+pysam
+
+[dev]
+pytest
+pysam

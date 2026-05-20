@@ -1,0 +1,17 @@
+README.md
+pyproject.toml
+splice/__init__.py
+splice/correction.py
+splice/data.py
+splice/extract.py
+splice/gtf.py
+splice/io.py
+splice/metrics.py
+splice/pipeline.py
+splice/stats.py
+splice_outlier.egg-info/PKG-INFO
+splice_outlier.egg-info/SOURCES.txt
+splice_outlier.egg-info/dependency_links.txt
+splice_outlier.egg-info/requires.txt
+splice_outlier.egg-info/top_level.txt
+tests/test_splice.py

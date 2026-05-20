@@ -1,0 +1,436 @@
+Metadata-Version: 2.1
+Name: splice-outlier
+Version: 0.3.0
+Summary: Fast, scalable detection of aberrant splicing events in RNA-seq cohorts.
+Requires-Python: >=3.8
+Description-Content-Type: text/markdown
+Requires-Dist: numpy
+Requires-Dist: pandas
+Requires-Dist: scipy
+Requires-Dist: tqdm
+Requires-Dist: statsmodels
+Requires-Dist: joblib
+Requires-Dist: pyarrow
+Requires-Dist: anndata
+Requires-Dist: scikit-learn
+Provides-Extra: bam
+Requires-Dist: pysam; extra == "bam"
+Provides-Extra: dev
+Requires-Dist: pytest; extra == "dev"
+Requires-Dist: pysam; extra == "dev"
+
+# splice-outlier
+
+Fast, scalable detection of aberrant splicing events in RNA-seq cohorts.
+Drop-in replacement for [FRASER2](https://github.com/gagneurlab/FRASER) designed for 10,000+ samples.
+
+## Key differences from FRASER2
+
+| | FRASER2 | splice-outlier |
+|---|---|---|
+| Language | R / Bioconductor | Python |
+| Confounder correction | Denoising autoencoder (O(S²)) | Randomised SVD (O(S·J·q)) |
+| Input | BAM + STAR SJ files | BAM only (parquet intermediary) |
+| Gene subset filtering | Not supported | ✓ named gene list + GTF |
+| Sashimi-concordant delta | ✗ | ✓ `delta_psi_raw`, shrinkage flag |
+| Per-sample gene subset FDR | ✓ | ✓ |
+| Scale tested | ~500 samples | 10,000+ samples |
+
+---
+
+## Installation
+
+```bash
+# With BAM extraction support (recommended)
+pip install "splice-outlier[bam]"
+
+# Pipeline only — no BAM extraction (no pysam required)
+pip install splice-outlier
+
+# Development install
+git clone https://github.com/your-org/splice-outlier
+cd splice-outlier
+pip install -e ".[dev]"
+```
+
+**Dependencies:** numpy, scipy, pandas, anndata, scikit-learn, joblib, tqdm,
+statsmodels, pyarrow. BAM extraction additionally requires pysam ≥ 0.21.
+
+---
+
+## Workflow overview
+
+The two steps are fully decoupled. You can extract counts from BAMs one at a
+time — on different machines, over days or weeks — and run the cohort analysis
+whenever you are ready.
+
+```
+BAM files                    Parquet files              Results
+(one per sample)             (one per sample)
+──────────────               ──────────────────         ──────────────────────
+sample_01.bam  ──step 1──>  sample_01.splice.parquet ──┐
+sample_02.bam  ──step 1──>  sample_02.splice.parquet ──┤──step 2──> outliers.csv
+...                          ...                        ┘
+sample_N.bam   ──step 1──>  sample_N.splice.parquet  ──┘
+```
+
+Step 1 runs once per BAM and is embarrassingly parallel across samples.
+Step 2 runs once on the full cohort of parquet files. Re-running step 2 with
+more samples is fast and does not require re-processing any BAMs.
+
+---
+
+## Step 1 — extract per-sample counts from BAM files
+
+```python
+import splice
+
+splice.extract_sample_counts(
+    "sample.bam",
+    "counts/sample.splice.parquet",
+    library_type="fr-firststrand",   # see library types below
+    min_anchor=5,                    # matches FRASER2 minAnchor default
+    min_mapping_quality=255,         # 255 = STAR unique mappers
+    min_split_reads=2,               # discard very rare junctions
+)
+```
+
+**Targeted panel** — if you only care about a set of genes, passing
+`gene_subset` restricts the BAM scan to those gene windows, which is
+substantially faster:
+
+```python
+splice.extract_sample_counts(
+    "sample.bam",
+    "counts/sample.splice.parquet",
+    gene_subset=["MCOLN1", "TIMMDC1", "CLPP"],
+    gene_annotation="hg38.gtf.gz",
+)
+```
+
+**Parallelise across a cohort:**
+
+```python
+from joblib import Parallel, delayed
+
+Parallel(n_jobs=32)(
+    delayed(splice.extract_sample_counts)(
+        bam,
+        bam.replace(".bam", ".splice.parquet"),
+        library_type="fr-firststrand",
+    )
+    for bam in bam_files
+)
+```
+
+### Library type options
+
+| Value | Protocol | Read 1 maps to |
+|---|---|---|
+| `fr-firststrand` | dUTP, Illumina TruSeq (default) | Antisense strand |
+| `fr-secondstrand` | Ligation, NEB Ultra Directional | Sense strand |
+| `unstranded` | Standard (non-stranded) | Either strand |
+
+---
+
+## Step 2 — detect outliers across the cohort
+
+```python
+results = splice.find_outliers(
+    "counts/*.splice.parquet",          # glob picks up all parquets
+    sample_annotation="samples.tsv",   # optional: TSV/CSV with sampleID column
+    gene_annotation="hg38.gtf.gz",     # optional: GTF for gene labels
+    gene_subset=["MCOLN1", "TIMMDC1"], # optional: restrict to these genes
+    fdr_threshold=0.05,
+    delta_jaccard=0.1,
+    n_jobs=8,
+    verbose=True,
+)
+
+results.to_csv("splicing_outliers.csv", index=False)
+```
+
+**`sample_annotation`** is a TSV or CSV with at minimum a `sampleID` column.
+Any additional columns (tissue, diagnosis, batch, affected status) are
+forwarded into the results for downstream filtering.
+
+**`gene_annotation`** accepts:
+- A GTF file (`.gtf` or `.gtf.gz`) — Ensembl/GENCODE format
+- A pre-built interval TSV with columns `seqnames, start, end, gene_id, gene_name`
+  (faster for repeated runs — save once with `parse_gtf(gtf).to_csv(...)`)
+
+### Saving the intermediate object (large cohorts)
+
+For cohorts > 5,000 samples the confounder correction is the most expensive
+step. Use `save_intermediate` to persist the corrected `SplicingData` object
+so you can re-run just the outlier calling with different thresholds without
+repeating the SVD:
+
+```python
+results = splice.find_outliers(
+    "counts/*.splice.parquet",
+    save_intermediate="cohort_corrected.h5ad",
+    fdr_threshold=0.05,
+)
+
+# Later — reload and re-call with different parameters, no SVD re-run
+sd = splice.SplicingData.load("cohort_corrected.h5ad")
+results = splice.call_outliers(sd, fdr_threshold=0.01, delta_jaccard=0.15)
+```
+
+---
+
+## Clinical use — per-sample gene subset FDR
+
+Focus statistical power on candidate genes identified from exome or genome
+sequencing, mirroring FRASER2's `calculatePadjValuesOnSubset()`:
+
+```python
+results = splice.find_outliers(
+    "counts/*.splice.parquet",
+    gene_annotation="hg38.gtf.gz",
+    genes_per_sample={
+        "patient_01": ["MCOLN1", "TIMMDC1"],
+        "patient_02": ["CLPP"],
+        "patient_03": ["TTN", "RYR1"],
+    },
+    fdr_threshold=0.05,
+)
+
+# Significant within the candidate gene set
+sig = results[results["padj"] < 0.05]
+
+# Events flagged as subset-corrected
+subset_hits = results[results["fdr_subset"]]
+```
+
+Samples not listed in `genes_per_sample` receive standard within-gene FDR.
+Gene matching is case-insensitive and works against both `gene_name` and
+`gene_id`.
+
+---
+
+## Sashimi plot discordance — correction shrinkage flag
+
+FRASER2 sometimes shows a small `delta_psi` while the Sashimi plot shows a
+large visible difference. This happens when the confounder correction absorbs
+real signal (the aberrant event resembles a principal component of cohort
+variation). splice-outlier surfaces this explicitly:
+
+```python
+# Events where the model has underestimated the apparent effect size
+flagged = results[results["correction_shrinkage_flag"]]
+print(flagged[["sampleID", "gene_name",
+               "delta_psi",           # corrected — what the model sees
+               "delta_psi_raw",       # raw — what the Sashimi plot shows
+               "padj"]])
+
+# Rule: if delta_psi_raw is large but delta_psi is small, inspect manually
+# regardless of padj
+```
+
+Flagged events are **always retained in the output** even when corrected
+`|delta_psi|` is below `delta_jaccard`, so they are never silently dropped
+from clinical reports.
+
+---
+
+## Step-by-step API
+
+For more control, run each stage individually:
+
+```python
+import splice
+
+# Read parquet files into SplicingData
+sd = splice.read_counts(
+    "counts/*.splice.parquet",
+    sample_annotation="samples.tsv",
+    gene_annotation="hg38.gtf.gz",
+    gene_subset=["MCOLN1", "TIMMDC1"],   # optional
+    n_jobs=8,
+)
+
+# Filter low-coverage junctions (FRASER2 defaults)
+sd = splice.filter_junctions(
+    sd,
+    min_split_reads=20,
+    min_site_reads=10,
+    site_count_percentile=25.0,
+)
+
+# Compute intron Jaccard index
+sd = splice.compute_jaccard(sd)
+
+# Remove latent confounders via randomised SVD
+# n_components=None → auto-select via Marchenko-Pastur noise threshold
+sd = splice.correct_confounders(sd, n_components=None)
+
+# Persist corrected object (skip expensive SVD on re-runs)
+sd.save("cohort_corrected.h5ad")
+
+# Call outliers with per-sample gene subset FDR
+results = splice.call_outliers(
+    sd,
+    fdr_threshold=0.05,
+    delta_jaccard=0.1,
+    genes_per_sample={"patient_01": ["MCOLN1"]},
+    shrinkage_threshold=3.0,
+)
+```
+
+### GTF utilities
+
+```python
+# Parse a GTF into a gene interval DataFrame
+intervals = splice.parse_gtf("hg38.gtf.gz")
+intervals.to_csv("hg38_intervals.tsv", sep="\t", index=False)  # cache for reuse
+
+# Get intervals for specific genes
+target = splice.genes_to_intervals(intervals, ["MCOLN1", "TIMMDC1", "CLPP"])
+
+# Filter a junction DataFrame to target genes
+filtered = splice.filter_junctions_to_genes(junction_df, target)
+```
+
+---
+
+## Output columns
+
+All columns from FRASER2's result table are present. Three new diagnostic
+columns are added.
+
+| Column | Type | Description |
+|---|---|---|
+| `sampleID` | str | Sample identifier |
+| `seqnames` | str | Chromosome / contig |
+| `start` | int | Intron start (1-based, inclusive) |
+| `end` | int | Intron end (1-based, inclusive) |
+| `strand` | str | `+`, `-`, or `*` |
+| `intron_id` | str | `seqnames:start-end:strand` |
+| `gene_id` | str | Ensembl gene ID |
+| `gene_name` | str | HGNC gene symbol |
+| `pvalue` | float | Two-sided beta-binomial p-value |
+| `padj` | float | BH FDR within gene (or per-sample subset) |
+| `delta_psi` | float | `observed_J − model_expected_J` — confounder-corrected effect size |
+| `delta_psi_raw` | float | `observed_J − cohort_median_J` — **Sashimi-concordant**, no correction applied |
+| `delta_psi_unweighted` | float | `observed_J − cohort_mean_J` — mean-based alternative to raw delta |
+| `observed_psi` | float | Observed intron Jaccard index for this sample |
+| `expected_psi` | float | Model-expected Jaccard index (from corrected layer) |
+| `counts` | int | Split reads supporting this junction in this sample |
+| `total_counts` | int | Total reads at the splice site in this sample |
+| `fdr_subset` | bool | `True` if per-sample gene subset FDR was applied to this row |
+| `correction_shrinkage_flag` | bool | `True` when `\|delta_psi_raw\| / \|delta_psi\| > shrinkage_threshold` AND `\|delta_psi_raw\| > 0.1` — the confounder correction has substantially reduced the apparent effect size; inspect Sashimi plot regardless of `padj` |
+
+---
+
+## Full parameter reference
+
+### `extract_sample_counts(bam_path, output_path, ...)`
+
+| Parameter | Default | Description |
+|---|---|---|
+| `library_type` | `fr-firststrand` | Strand inference for unsplit reads |
+| `min_mapping_quality` | `255` | Minimum MAPQ (255 = STAR unique, 60 = HISAT2 unique) |
+| `min_split_reads` | `2` | Junctions with fewer split reads are discarded |
+| `min_anchor` | `5` | Minimum bases a non-split read must extend past the splice site on each side (matches FRASER2 `minAnchor`) |
+| `gene_subset` | `None` | List of gene names or IDs — restricts output and speeds up pass 2 BAM scan |
+| `gene_annotation` | `None` | GTF path or interval DataFrame (required when `gene_subset` is set) |
+| `n_jobs` | `1` | Parallel workers (used when called via joblib externally) |
+| `verbose` | `True` | Print per-sample progress |
+
+### `find_outliers(count_files, ...)`
+
+| Parameter | Default | Description |
+|---|---|---|
+| `sample_annotation` | `None` | TSV/CSV or DataFrame with `sampleID` column; extra columns forwarded to results |
+| `gene_annotation` | `None` | GTF, interval TSV, or DataFrame for gene labelling and subsetting |
+| `gene_subset` | `None` | Restrict entire analysis to junctions within these genes; requires `gene_annotation` |
+| `min_split_reads` | `20` | Junction filter: minimum split reads in ≥ 1 sample (FRASER2 default k=20) |
+| `min_site_reads` | `10` | Junction filter: minimum site count at `site_count_percentile` (FRASER2 default n=10) |
+| `site_count_percentile` | `25.0` | Percentile used for `min_site_reads` check |
+| `n_components` | `None` | PCs to remove for confounder correction; `None` = auto via Marchenko-Pastur |
+| `fdr_threshold` | `0.05` | Benjamini-Hochberg FDR cutoff |
+| `delta_jaccard` | `0.1` | Minimum `\|delta_psi\|` effect size; `correction_shrinkage_flag=True` rows retained regardless |
+| `min_coverage` | `10` | Minimum site read coverage to report a call |
+| `genes_per_sample` | `None` | Dict `{sampleID: [gene_names]}` for per-sample gene subset FDR |
+| `shrinkage_threshold` | `3.0` | `\|delta_psi_raw\| / \|delta_psi\|` ratio above which `correction_shrinkage_flag` is set |
+| `n_jobs` | `1` | Parallel workers for file reading and junction scoring |
+| `save_intermediate` | `None` | Path to save corrected `SplicingData` as `.h5ad` after SVD step |
+| `verbose` | `True` | Print pipeline progress |
+
+### `read_counts(pattern, ...)`
+
+| Parameter | Default | Description |
+|---|---|---|
+| `sample_annotation` | `None` | TSV/CSV or DataFrame with `sampleID` column |
+| `sample_id_from_path` | `True` | Derive `sampleID` from filename stem (strip `.splice.parquet`) |
+| `gene_annotation` | `None` | GTF, interval TSV, or DataFrame |
+| `gene_subset` | `None` | Restrict junction universe to these genes |
+| `n_jobs` | `1` | Parallel file reading workers |
+| `verbose` | `True` | Print progress |
+
+### `call_outliers(sd, ...)`
+
+| Parameter | Default | Description |
+|---|---|---|
+| `fdr_threshold` | `0.05` | BH FDR cutoff |
+| `delta_jaccard` | `0.1` | Minimum `\|delta_psi\|` effect size |
+| `min_coverage` | `10` | Minimum `total_counts` to include a call |
+| `use_corrected` | `True` | Use confounder-corrected layer for `expected_psi` |
+| `genes_per_sample` | `None` | Per-sample gene subset FDR dict |
+| `shrinkage_threshold` | `3.0` | Ratio threshold for `correction_shrinkage_flag` |
+| `n_jobs` | `1` | Parallel workers |
+| `verbose` | `True` | Print summary |
+
+---
+
+## How it works
+
+1. **BAM extraction** (`extract.py`) — two-pass scan producing a compact
+   parquet (~5–15 MB) per sample. Pass 1 discovers all junctions from reads
+   with N-CIGAR operations and counts split reads. Pass 2 counts non-split
+   reads at each splice site using a configurable anchor filter. When
+   `gene_subset` is provided, pass 2 fetches only within target gene coordinate
+   windows, which is the primary speed gain for targeted panels.
+
+2. **Jaccard index** (`metrics.py`) — computes
+   `J = s_canon / (s_canon + s_alt + u_unsplit)` per (sample, junction) using
+   BAM-extracted unsplit counts. Falls back to a PSI approximation when unsplit
+   counts are unavailable.
+
+3. **Confounder correction** (`correction.py`) — double-demeaned logit-Jaccard
+   matrix is decomposed via randomised truncated SVD. The top-q principal
+   components are projected out. q is auto-selected via the Marchenko-Pastur
+   noise boundary. 10–100× faster than FRASER2's denoising autoencoder at
+   large cohort sizes.
+
+4. **Outlier scoring** (`stats.py`) — beta-binomial parameters are fit per
+   junction via vectorised method of moments. Two-sided p-values are computed
+   for every (sample, junction) pair. BH FDR is applied within each gene, or
+   within per-sample gene subsets. Three delta PSI columns expose corrected vs
+   raw signal discordance.
+
+---
+
+## Development
+
+```bash
+pip install -e ".[dev]"
+pytest tests/ -v
+pytest tests/ -v --cov=splice --cov-report=term-missing
+```
+
+---
+
+## Citation
+
+If you use splice-outlier in published work, please also cite FRASER2:
+
+> Scheller et al. (2023) Improved detection of aberrant splicing with FRASER 2.0
+> and the intron Jaccard index. *Am J Hum Genet* 110(12):2056–2067.
+> https://doi.org/10.1016/j.ajhg.2023.10.014
+
+## License
+
+MIT
